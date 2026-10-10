@@ -8,8 +8,10 @@ import pytest
 from inspect_ai.model._generate_config import GenerateConfig
 from inspect_ai.model._model_call import ModelCall
 from inspect_ai.model._model_output import ModelOutput, ModelUsage
+from inspect_ai.model._openai import OpenAIResponseError
 from inspect_ai.model._providers.openrouter import (
     OpenRouterAPI,
+    OpenRouterError,
     _add_anthropic_cache_markers,
     _apply_cache_creation_usage,
 )
@@ -772,3 +774,75 @@ async def test_openrouter_responses_api_does_not_send_explicit_cache_fields(
         if isinstance(content, list):
             for block in content:
                 assert "prompt_cache_breakpoint" not in block
+
+
+def _choice_error_response(code: int) -> dict[str, Any]:
+    """Raw OpenRouter response with the error embedded in choices[0].
+
+    This is the shape OpenRouter returns for a non-streaming completion that
+    hits an upstream rate limit partway through: HTTP 200, finish_reason
+    "error", and the error object inside the choice.
+    """
+    return {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "The expert"},
+                "finish_reason": "error",
+                "native_finish_reason": None,
+                "error": {
+                    "code": code,
+                    "message": "google/gemini-2.5-flash is temporarily rate-limited upstream.",
+                    "metadata": {"error_type": "rate_limit_exceeded"},
+                },
+            }
+        ],
+    }
+
+
+def test_on_response_raises_retryable_for_choice_embedded_429() -> None:
+    """A 429 inside choices[0] must raise like a top-level 429 (issue #5792)."""
+    api = _make_api("openrouter/google/gemini-2.5-flash")
+    with pytest.raises(OpenAIResponseError) as exc_info:
+        api.on_response(_choice_error_response(429))
+    assert exc_info.value.code == "rate_limit_exceeded"
+    # the existing retry classifier must treat it as retryable
+    assert api.should_retry(exc_info.value)
+
+
+def test_on_response_raises_retryable_for_choice_embedded_500() -> None:
+    api = _make_api("openrouter/google/gemini-2.5-flash")
+    with pytest.raises(OpenAIResponseError) as exc_info:
+        api.on_response(_choice_error_response(500))
+    assert exc_info.value.code == "server_error"
+    assert api.should_retry(exc_info.value)
+
+
+def test_on_response_raises_openrouter_error_for_choice_embedded_other() -> None:
+    """Non-retryable choice errors surface as OpenRouterError, as top-level ones do."""
+    api = _make_api("openrouter/google/gemini-2.5-flash")
+    with pytest.raises(OpenRouterError):
+        api.on_response(_choice_error_response(400))
+
+
+def test_on_response_ignores_choices_without_errors() -> None:
+    api = _make_api("openrouter/google/gemini-2.5-flash")
+    api.on_response(
+        {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+
+
+def test_on_response_top_level_error_still_takes_precedence() -> None:
+    """A top-level error must win over any choice-level error."""
+    api = _make_api("openrouter/google/gemini-2.5-flash")
+    response = _choice_error_response(500)
+    response["error"] = {"code": 429, "message": "top-level rate limit"}
+    with pytest.raises(OpenAIResponseError) as exc_info:
+        api.on_response(response)
+    assert exc_info.value.code == "rate_limit_exceeded"

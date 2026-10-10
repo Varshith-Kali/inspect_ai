@@ -1,6 +1,6 @@
 import json
 from logging import getLogger
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from openai.types.chat import (
     ChatCompletion,
@@ -76,6 +76,28 @@ class OpenRouterError(Exception):
             if "metadata" in self.response
             else ""
         )
+
+
+def _raise_for_error_response(error: ErrorResponse) -> NoReturn:
+    if error["code"] == 429:
+        raise OpenAIResponseError("rate_limit_exceeded", error["message"])
+    elif error["code"] in [408, 500, 502, 504]:
+        raise OpenAIResponseError("server_error", error["message"])
+    else:
+        raise OpenRouterError(error)
+
+
+def _choice_error(response: dict[str, Any]) -> ErrorResponse | None:
+    """Return the first error embedded in a response choice, if any."""
+    choices = response.get("choices", None)
+    if not isinstance(choices, list):
+        return None
+    for choice in choices:
+        if isinstance(choice, dict):
+            choice_error = choice.get("error", None)
+            if isinstance(choice_error, dict):
+                return cast(ErrorResponse, choice_error)
+    return None
 
 
 class OpenRouterAPI(OpenAICompatibleAPI):
@@ -276,12 +298,14 @@ class OpenRouterAPI(OpenAICompatibleAPI):
         # OpenAIResponseError for cases where we should retry)
         error: ErrorResponse | None = response.get("error", None)
         if error is not None:
-            if error["code"] == 429:
-                raise OpenAIResponseError("rate_limit_exceeded", error["message"])
-            elif error["code"] in [408, 500, 502, 504]:
-                raise OpenAIResponseError("server_error", error["message"])
-            else:
-                raise OpenRouterError(error)
+            _raise_for_error_response(error)
+
+        # OpenRouter can also embed the error inside a choice while still
+        # returning HTTP 200 (finish_reason == "error"). Surface it the same
+        # way so the call is retried instead of truncated partial text being
+        # returned as the model's output.
+        elif (choice_error := _choice_error(response)) is not None:
+            _raise_for_error_response(choice_error)
 
         # check for an empty response (which they document can occur on
         # startup). for this we'll return a "server_error" which will
