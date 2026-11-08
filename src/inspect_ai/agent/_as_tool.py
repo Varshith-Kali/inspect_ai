@@ -1,5 +1,6 @@
+import inspect
 import re
-from typing import Any
+from typing import Any, get_type_hints
 
 from shortuuid import uuid as shortuuid
 
@@ -89,6 +90,16 @@ def as_tool(
         else:
             return ""
 
+    # give the wrapper the agent's signature (minus state and curried
+    # params, plus input) so tool arguments are converted to the agent's
+    # declared types instead of passed through as raw JSON values
+    # (setattr: inspect.signature reads __signature__, but functions do
+    # not declare it as an assignable attribute)
+    signature, annotations = _execute_signature(agent, agent_kwargs)
+    setattr(execute, "__signature__", signature)
+    execute.__annotations__ = annotations
+    execute.__doc__ = inspect.getdoc(agent)
+
     # add "input" param
     tool_info.parameters.properties = {
         "input": ToolParam(type="string", description="Input message.")
@@ -107,6 +118,59 @@ def as_tool(
         max_output=max_output,
     )
     return tool_def.as_tool()
+
+
+def _execute_signature(
+    agent: Agent, agent_kwargs: dict[str, Any]
+) -> tuple[inspect.Signature, dict[str, Any]]:
+    """Signature and annotations for the as_tool() wrapper execute function.
+
+    Mirrors the agent's own parameters (minus `state` and curried
+    parameters, plus the `input: str` argument that carries the state)
+    so tool_params() converts model-supplied arguments against the
+    agent's declared types, the way it does for handoffs and @tool
+    functions. Without this the wrapper's `**kwargs: Any` makes
+    tool_params() pass every argument through as raw JSON.
+
+    Raises:
+        ValueError: If the agent has a non-curried parameter named
+            `input`, which clashes with the `input` argument as_tool()
+            adds. Agents that take `**kwargs` keep the existing
+            pass-through behaviour for those arguments.
+    """
+    try:
+        type_hints = get_type_hints(agent)
+    except Exception:
+        type_hints = {}
+    parameters = [
+        inspect.Parameter(
+            "input", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str
+        )
+    ]
+    annotations: dict[str, Any] = {"input": str, "return": ToolResult}
+    for name, param in inspect.signature(agent).parameters.items():
+        if name == "state" or name in agent_kwargs:
+            continue
+        if name == "input":
+            raise ValueError(
+                f"Agent {agent_tool_name(agent)} has a parameter named 'input', "
+                + "which clashes with the 'input' argument as_tool() adds. "
+                + "Rename the parameter or curry it with "
+                + "as_tool(agent, input=...)."
+            )
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        annotation = type_hints.get(name, param.annotation)
+        parameters.append(param.replace(annotation=annotation))
+        if annotation is not inspect.Parameter.empty:
+            annotations[name] = annotation
+    return (
+        inspect.Signature(parameters, return_annotation=ToolResult),
+        annotations,
+    )
 
 
 def agent_tool_info(

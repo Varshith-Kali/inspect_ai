@@ -1,6 +1,11 @@
+import inspect
+from dataclasses import dataclass
+from datetime import date
+from enum import Enum
 from typing import Callable, TypeAlias
 
 import pytest
+from pydantic import BaseModel
 from test_helpers.limits import check_limit_event
 
 from inspect_ai import eval
@@ -18,7 +23,7 @@ from inspect_ai.model._model_output import ModelOutput, ModelUsage
 from inspect_ai.solver._solver import Generate, Solver, solver
 from inspect_ai.solver._task_state import TaskState
 from inspect_ai.solver._use_tools import use_tools
-from inspect_ai.tool import ToolDef
+from inspect_ai.tool import ToolDef, tool
 from inspect_ai.tool._tool import Tool
 from inspect_ai.tool._tool_call import ToolCall
 from inspect_ai.util._limit import LimitExceededError, message_limit, token_limit
@@ -213,6 +218,221 @@ def test_agent_as_tool_no_docs_error():
 
 def test_agent_as_tool_no_param_docs_error():
     check_agent_as_tool_no_param_docs_error(as_tool)
+
+
+class TypedPriority(Enum):
+    LOW = "low"
+    HIGH = "high"
+
+
+class TypedReport(BaseModel):
+    title: str
+    score: int
+
+
+@dataclass
+class TypedConfig:
+    retries: int
+    label: str
+
+
+def typed_arguments_text(
+    priority: TypedPriority,
+    report: TypedReport,
+    config: TypedConfig,
+    due: date,
+    tags: set[str],
+    count: int = 3,
+) -> str:
+    return "|".join(
+        [
+            repr(priority),
+            repr(report),
+            repr(config),
+            repr(due),
+            repr(sorted(tags)),
+            str(count),
+        ]
+    )
+
+
+TYPED_ARGUMENTS = {
+    "priority": "high",
+    "report": {"title": "t", "score": 3},
+    "config": {"retries": 2, "label": "x"},
+    "due": "2026-11-08",
+    "tags": ["a", "b"],
+}
+
+TYPED_ARGUMENTS_TEXT = (
+    "<TypedPriority.HIGH: 'high'>|TypedReport(title='t', score=3)"
+    "|TypedConfig(retries=2, label='x')|datetime.date(2026, 11, 8)"
+    "|['a', 'b']|3"
+)
+
+
+TYPED_ARGUMENTS_SEEN: list[str] = []
+
+
+@agent
+def typed_params_agent() -> Agent:
+    async def execute(
+        state: AgentState,
+        priority: TypedPriority,
+        report: TypedReport,
+        config: TypedConfig,
+        due: date,
+        tags: set[str],
+        count: int = 3,
+    ) -> AgentState:
+        """Agent with typed parameters.
+
+        Args:
+            state: Input state (conversation)
+            priority: How urgent the research is
+            report: Report to file
+            config: Run config
+            due: Due date
+            tags: Tags for the run
+            count: How many items to return
+
+        Returns:
+            Output state (additions to conversation)
+        """
+        text = typed_arguments_text(priority, report, config, due, tags, count)
+        TYPED_ARGUMENTS_SEEN.append(text)
+        state.output = ModelOutput.from_content("mockllm/model", text)
+        return state
+
+    return execute
+
+
+@tool
+def typed_params_tool():
+    async def execute(
+        priority: TypedPriority,
+        report: TypedReport,
+        config: TypedConfig,
+        due: date,
+        tags: set[str],
+        count: int = 3,
+    ) -> str:
+        """Tool with typed parameters.
+
+        Args:
+            priority: How urgent the research is
+            report: Report to file
+            config: Run config
+            due: Due date
+            tags: Tags for the run
+            count: How many items to return
+        """
+        return typed_arguments_text(priority, report, config, due, tags, count)
+
+    return execute
+
+
+def check_typed_arguments(
+    tool,
+    function_name: str,
+    arguments: dict,
+    expect_tool_text: bool = True,
+    expect_seen: bool = True,
+):
+    TYPED_ARGUMENTS_SEEN.clear()
+    log = eval(
+        Task(
+            solver=[
+                use_tools(tool),
+                call_looping_agent(function_name, arguments=arguments),
+            ]
+        )
+    )[0]
+
+    assert log.status == "success"
+    assert log.samples
+    # what the agent itself received, whatever the tool result renders as
+    if expect_seen:
+        assert TYPED_ARGUMENTS_SEEN == [TYPED_ARGUMENTS_TEXT]
+    if not expect_tool_text:
+        return
+    tool_messages = [
+        message
+        for message in log.samples[0].messages
+        if isinstance(message, ChatMessageTool)
+    ]
+    assert tool_messages
+    tool_message = tool_messages[-1]
+    assert tool_message.error is None
+    assert tool_message.text == TYPED_ARGUMENTS_TEXT
+
+
+def test_agent_as_tool_converts_typed_arguments():
+    check_typed_arguments(
+        as_tool(typed_params_agent()),
+        "typed_params_agent",
+        {"input": "topic", **TYPED_ARGUMENTS},
+    )
+
+
+def test_agent_as_tool_converts_typed_arguments_with_curry():
+    check_typed_arguments(
+        as_tool(typed_params_agent(), priority=TypedPriority.HIGH),
+        "typed_params_agent",
+        {
+            "input": "topic",
+            **{k: v for k, v in TYPED_ARGUMENTS.items() if k != "priority"},
+        },
+    )
+
+
+def test_agent_as_tool_wrapper_signature():
+    tool_def = ToolDef(as_tool(typed_params_agent()))
+    signature = inspect.signature(tool_def.tool)
+    assert signature.parameters["input"].annotation is str
+    assert signature.parameters["priority"].annotation is TypedPriority
+    assert signature.parameters["report"].annotation is TypedReport
+    assert signature.parameters["config"].annotation is TypedConfig
+    assert signature.parameters["due"].annotation is date
+    assert signature.parameters["tags"].annotation == set[str]
+    assert signature.parameters["count"].default == 3
+
+
+def test_agent_as_tool_input_param_clash():
+    @agent
+    def input_param_agent() -> Agent:
+        async def execute(state: AgentState, input: str) -> AgentState:
+            """Agent with an input parameter.
+
+            Args:
+                state: Input state (conversation)
+                input: The agent's own input parameter
+
+            Returns:
+                Output state (additions to conversation)
+            """
+            state.output.completion = input
+            return state
+
+        return execute
+
+    with pytest.raises(ValueError, match="clashes with the 'input' argument"):
+        as_tool(input_param_agent())
+
+
+def test_agent_handoff_converts_typed_arguments():
+    check_typed_arguments(
+        handoff(typed_params_agent()),
+        "transfer_to_typed_params_agent",
+        TYPED_ARGUMENTS,
+        expect_tool_text=False,
+    )
+
+
+def test_tool_converts_typed_arguments():
+    check_typed_arguments(
+        typed_params_tool(), "typed_params_tool", TYPED_ARGUMENTS, expect_seen=False
+    )
 
 
 def test_agent_as_tool_respects_limits() -> None:
