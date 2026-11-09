@@ -69,6 +69,18 @@ _PERCENT_SUFFIX = re.compile(
 )
 _LATEX_NUMBER = re.compile(r"[+-]?(?:\d+|\d*\.\d+)(?:E[+-]?\d+)?\Z")
 _LATEX_COMMA_NUMBER = re.compile(r"\s*-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*\Z")
+# A base-n numeral: digits followed by a base subscript, `11010_2` or
+# `11010_{2}`. The numeral must start with a digit and stand apart from any
+# larger token, so subscripted variables (`x_1`), function names (`log_2`),
+# and decimal points (`1.5_2`) never match; the subscript must be the whole
+# run that follows, so PEP 515 grouping (`1_000`, `1_234`) never matches.
+_BASE_SUBSCRIPT = re.compile(
+    r"(?<![\d_.A-Za-z])"
+    r"(\d[0-9A-Za-z]*)"
+    r"_"
+    r"(?:\{(\d{1,2})\}|(\d{1,2}))"
+    r"(?![\dA-Za-z])"
+)
 # LaTeX thin-space digit grouping, e.g. "1\,234" — a thousands separator.
 _LATEX_THIN_SPACE_NUMBER = re.compile(r"\s*-?\d{1,3}(?:\\,\d{3})+(?:\.\d+)?\s*\Z")
 _DIGIT_RUN = re.compile(r"\d+")
@@ -698,6 +710,30 @@ class _PlainExpressionBuilder(ast.NodeVisitor):
         return self.sympy.And(*relations, evaluate=False)
 
 
+def _convert_base_subscripts(text: str) -> str:
+    """Rewrite base-n numerals (`11010_2`, `11010_{2}`) as decimal integers.
+
+    Without this, the plain parser reads `11010_2` as the PEP 515 integer
+    110102 while the LaTeX parser drops the subscript and reads 11010, so
+    the two spellings of one value never match. A match is converted only
+    when the base is between 2 and 36 and every digit is valid in that base;
+    anything else (grouped thousands, subscripted variables, digits invalid
+    in the claimed base) is left untouched for the parsers to handle as before.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        digits = match.group(1)
+        base = int(match.group(2) or match.group(3))
+        if not 2 <= base <= 36:
+            return match.group(0)
+        try:
+            return str(int(digits, base))
+        except ValueError:
+            return match.group(0)
+
+    return _BASE_SUBSCRIPT.sub(replace, text)
+
+
 def _parse_plain_expression(
     candidate: str, sympy: Any, policy: _SymbolPolicy | None = None
 ) -> Any | None:
@@ -709,6 +745,7 @@ def _parse_plain_expression(
         policy = _SymbolPolicy.for_candidate(candidate, _plain_looks_complex)
     text = candidate.strip()
     text = text.replace("\u00d7", "*").replace("\u00f7", "/").replace("^", "**")
+    text = _convert_base_subscripts(text)
 
     # A bare grouped-thousands number (e.g. "1,234", "12,345,678") would parse
     # as a tuple; strip the separators so it reads as a single number, matching
@@ -777,6 +814,11 @@ def _parse_latex_expression(
         ConversionConfig,
         _Latex2Sympy,
     )
+
+    # Base-n numerals reach this parser when the plain parser rejects the
+    # candidate (e.g. `\frac{11010_{2}}{2}`); convert them here too so both
+    # parsers read the same value.
+    candidate = _convert_base_subscripts(candidate)
 
     normalized_candidate = re.sub(
         r"\\(?:left|right|Bigl|Bigr|bigl|bigr|Big|big|Large|large)\b",

@@ -429,6 +429,61 @@ def test_grouped_thousands_normalization_leaves_structures_intact(answer: str) -
 
 @pytest.mark.parametrize(
     "answer,target",
+    [
+        # The four rows from #6414: both spellings of a base-n numeral read
+        # as the same decimal value, and the glued decimal does not match.
+        (r"\boxed{11010_{2}}", "11010_2"),
+        (r"\boxed{-221_{3}}", "-221_3"),
+        (r"\boxed{4210_5}", "4210_{5}"),
+        # The decimal value itself matches in either direction.
+        (r"\boxed{26}", "11010_2"),
+        (r"\boxed{11010_2}", "26"),
+        # Other bases, both spellings.
+        (r"\boxed{101_2}", "5"),
+        (r"\boxed{17_8}", "15"),
+        (r"\boxed{17_{8}}", "15"),
+        (r"\boxed{1A_{16}}", "26"),
+        (r"\boxed{19_{16}}", "25"),
+        # A base-n numeral inside an expression only the LaTeX parser handles.
+        (r"\boxed{\frac{11010_{2}}{2}}", "13"),
+    ],
+)
+def test_base_subscripts_match_across_spellings(answer: str, target: str) -> None:
+    assert _score_answer(answer, (target,)).status == "correct"
+
+
+@pytest.mark.parametrize(
+    "answer,target",
+    [
+        (r"\boxed{110102}", "11010_2"),
+        (r"\boxed{11010}", "11010_2"),
+        (r"\boxed{\frac{11010_{2}}{2}}", "5505"),
+    ],
+)
+def test_base_subscripts_do_not_match_glued_decimal(answer: str, target: str) -> None:
+    assert _score_answer(answer, (target,)).status == "incorrect"
+
+
+@pytest.mark.parametrize(
+    "answer,target",
+    [
+        ("1_000", "1000"),
+        ("1_000_000", "1000000"),
+        ("1_234", "1234"),
+        ("x_1", "x_1"),
+        # Digits invalid in the claimed base are left alone rather than
+        # reinterpreted, so the numeral keeps its previous reading.
+        ("19_8", "198"),
+    ],
+)
+def test_base_subscript_normalization_leaves_other_uses_intact(
+    answer: str, target: str
+) -> None:
+    assert _score_answer(answer, (target,)).status == "correct"
+
+
+@pytest.mark.parametrize(
+    "answer,target",
     [(r"1\,234", "1234"), (r"12\,345\,678", "12345678"), (r"1\,234.5", "1234.5")],
 )
 def test_latex_thin_space_thousands_are_numbers(answer: str, target: str) -> None:
